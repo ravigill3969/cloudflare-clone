@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -13,7 +14,43 @@ import (
 	"time"
 )
 
+type DDoS struct {
+	ipMutex sync.RWMutex
+	ipCount map[string]int
+	limit   int // threshold for flagging suspicious IPs
+}
 
+func NewDDoS(limit int) *DDoS {
+	return &DDoS{
+		ipCount: make(map[string]int),
+		limit:   limit,
+	}
+}
+
+func (d *DDoS) AddRequest(ip net.IP) {
+	d.ipMutex.Lock()
+	defer d.ipMutex.Unlock()
+	ipStr := ip.String()
+	d.ipCount[ipStr]++
+}
+
+func (d *DDoS) IsSuspicious(ip net.IP) bool {
+	d.ipMutex.RLock()
+	defer d.ipMutex.RUnlock()
+	return d.ipCount[ip.String()] > d.limit
+}
+
+func (d *DDoS) Stats() map[string]int {
+	d.ipMutex.RLock()
+	defer d.ipMutex.RUnlock()
+
+	// Return a copy to avoid race conditions
+	stats := make(map[string]int)
+	for k, v := range d.ipCount {
+		stats[k] = v
+	}
+	return stats
+}
 
 type cacheEntry struct {
 	body       []byte
@@ -24,6 +61,10 @@ type cacheEntry struct {
 
 func (e cacheEntry) isExpired() bool {
 	return time.Now().After(e.expiry)
+}
+
+func (d *DDoS) IncrementInIpRequests(ip net.IP) {
+
 }
 
 type Cache struct {
@@ -153,6 +194,16 @@ func expiryForContentType(contentType string) time.Time {
 }
 
 func main() {
+	ddos := NewDDoS(5)
+
+	for ipStr := range ddos.ipCount {
+		ip := net.ParseIP(ipStr)
+		ddos.AddRequest(ip)
+		if ddos.IsSuspicious(ip) {
+			fmt.Println("Suspicious traffic from:", ip)
+		}
+	}
+
 	cp, err := NewCacheProxy("http://localhost:8080")
 	if err != nil {
 		log.Fatal("Error creating proxy:", err)
