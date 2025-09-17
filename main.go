@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	ddos "cloudflare-clone/DDoS"
 	"fmt"
 	"io"
 	"log"
@@ -14,44 +15,6 @@ import (
 	"time"
 )
 
-type DDoS struct {
-	ipMutex sync.RWMutex
-	ipCount map[string]int
-	limit   int // threshold for flagging suspicious IPs
-}
-
-func NewDDoS(limit int) *DDoS {
-	return &DDoS{
-		ipCount: make(map[string]int),
-		limit:   limit,
-	}
-}
-
-func (d *DDoS) AddRequest(ip net.IP) {
-	d.ipMutex.Lock()
-	defer d.ipMutex.Unlock()
-	ipStr := ip.String()
-	d.ipCount[ipStr]++
-}
-
-func (d *DDoS) IsSuspicious(ip net.IP) bool {
-	d.ipMutex.RLock()
-	defer d.ipMutex.RUnlock()
-	return d.ipCount[ip.String()] > d.limit
-}
-
-func (d *DDoS) Stats() map[string]int {
-	d.ipMutex.RLock()
-	defer d.ipMutex.RUnlock()
-
-	// Return a copy to avoid race conditions
-	stats := make(map[string]int)
-	for k, v := range d.ipCount {
-		stats[k] = v
-	}
-	return stats
-}
-
 type cacheEntry struct {
 	body       []byte
 	header     http.Header
@@ -61,10 +24,6 @@ type cacheEntry struct {
 
 func (e cacheEntry) isExpired() bool {
 	return time.Now().After(e.expiry)
-}
-
-func (d *DDoS) IncrementInIpRequests(ip net.IP) {
-
 }
 
 type Cache struct {
@@ -147,7 +106,7 @@ func (cp *CacheProxy) cacheResponse(r *http.Response) error {
 
 func (cp *CacheProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		log.Println("🚫 Not caching method:", r.Method)
+		log.Println("Not caching method:", r.Method)
 		cp.proxy.ServeHTTP(w, r)
 		return
 	}
@@ -194,25 +153,36 @@ func expiryForContentType(contentType string) time.Time {
 }
 
 func main() {
-	ddos := NewDDoS(5)
+	counter := ddos.NewDDoS(5)
 
-	for ipStr := range ddos.ipCount {
-		ip := net.ParseIP(ipStr)
-		ddos.AddRequest(ip)
-		if ddos.IsSuspicious(ip) {
-			fmt.Println("Suspicious traffic from:", ip)
-		}
-	}
+	limiter := ddos.NewDDoSLimiter(3, 3*time.Second)
 
 	cp, err := NewCacheProxy("http://localhost:8080")
 	if err != nil {
 		log.Fatal("Error creating proxy:", err)
 	}
-
 	cp.StartEvictionLoop(1 * time.Second)
 
-	fmt.Println("Server is running on :8443")
-	if err := http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", cp); err != nil {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Invalid IP", http.StatusBadRequest)
+			return
+		}
+		ip := net.ParseIP(ipStr)
+
+		counter.AddRequest(ip)
+		if counter.IsSuspicious(ip) {
+			fmt.Println("Suspicious traffic from:", ip)
+		}
+
+		limiter.AllowRequest(ipStr)
+
+		cp.ServeHTTP(w, r)
+	})
+
+	fmt.Println("🚀 Server running on :8443")
+	if err := http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", handler); err != nil {
 		log.Fatal("Server error:", err)
 	}
 }
